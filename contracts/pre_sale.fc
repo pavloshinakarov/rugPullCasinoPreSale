@@ -1,0 +1,449 @@
+#include "imports/stdlib.fc";
+#include "imports/op-codes.fc";
+#include "imports/messages.fc";
+#include "imports/jetton-utils.fc";
+ 
+int transfer_amount() asm "200000000 PUSHINT"; ;; 0.2 TON
+int forward_amount() asm "50000000 PUSHINT"; ;; 0.05 TON
+int gas_consumption() asm "15000000 PUSHINT"; ;; 0.015 TON
+int min_amount() asm "1000000000 PUSHINT"; ;; 1 TON
+
+const int initial_value = 10000; ;; 1000000000 / 1000;
+const int deployment_time = 1728169508;
+
+(int, int, int, slice, slice, cell, cell, int) load_data() inline {
+  slice ds = get_data().begin_parse();
+
+  int presale = ds~load_uint(1);
+  int balance = ds~load_coins();
+  int referred_percentage = ds~load_uint(7);  
+  slice owner_address = ds~load_msg_addr();
+  slice jetton_master_address = ds~load_msg_addr();
+  cell jetton_wallet_code = ds~load_ref();
+  cell buyer_addresses = ds~load_ref();
+  int buyer_count = ds~load_uint(32);
+  
+  return (presale,
+          balance,
+          referred_percentage,
+          owner_address,
+          jetton_master_address,
+          jetton_wallet_code,
+          buyer_addresses,
+          buyer_count
+          );
+}
+
+() save_data (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers_addresses, int buyer_count) impure inline {
+    set_data(
+        begin_cell()
+        .store_uint(presale, 1)
+        .store_grams(balance)
+        .store_uint(referred_percentage, 7)
+        .store_slice(owner_address)
+        .store_slice(jetton_master_address)
+        .store_ref(jetton_wallet_code)
+        .store_ref(buyers_addresses)
+        .store_uint(buyer_count, 32)
+        .end_cell()
+    );
+}
+
+(int, int, int, slice, slice, cell, cell, int) get_wallet_data() method_id {
+  return load_data();
+}
+
+int get_data_presale() method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  return presale;
+}
+
+int get_data_balance() method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  return balance;
+}
+
+int get_data_referred_percentage() method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  return referred_percentage;
+}
+
+slice get_data_owner_address() method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  return owner_address;
+}
+
+slice get_data_jetton_master_address() method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  return jetton_master_address;
+}
+
+cell get_data_jetton_wallet_code() method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  return jetton_wallet_code;
+}
+
+int get_data_count() method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  return count;
+}
+
+cell pack_buyer_addresses(slice buyer, int jettons, int payed, cell tail) inline {
+    return begin_cell()
+           .store_slice(buyer)
+           .store_grams(jettons)
+           .store_uint(payed, 1)           
+           .store_ref(tail)
+           .end_cell();
+}
+
+cell pay_buyer(cell buyers, slice search_buyer_address, int query_id, slice jetton_master_address, cell jetton_wallet_code) inline {
+    slice parser = buyers.begin_parse();
+
+    if (parser.slice_bits() == 0) {
+      return buyers;
+    }
+
+    slice buyer_address = parser~load_msg_addr();
+    int jettons = parser~load_coins();
+    int payed = parser~load_uint(1);
+
+    if (equal_slice_bits(search_buyer_address, buyer_address)){
+      if (payed == 0) {
+          
+          slice child_wallet = calc_user_wallet(my_address(), jetton_master_address, jetton_wallet_code);
+
+          var msg = begin_cell()
+                  .store_msg_flag(msg_flag::bounceable)
+                  .store_slice(child_wallet)
+                  .store_coins(transfer_amount())
+                  .store_msgbody_prefix_ref(
+                    begin_cell()
+                    .store_op(op::transfer)
+                    .store_query_id(query_id)
+                    .store_coins(jettons)
+                    .store_slice(buyer_address)
+                    .store_slice(buyer_address)
+                    .store_int(false, 1)
+                    .store_coins(forward_amount())
+                    .store_int(false, 1)
+                    .end_cell()
+                  );
+
+          send_raw_message(msg.end_cell(), REVERT_ON_ERRORS);
+
+          cell next = parser~load_ref();
+
+          return pack_buyer_addresses(buyer_address, jettons, 1, next);
+      }
+    }
+
+    if (parser.slice_refs() == 0) {
+      return buyers;
+    }
+
+    cell next = parser~load_ref();
+
+    cell next_buyer = pay_buyer(next, search_buyer_address, query_id, jetton_master_address, jetton_wallet_code);
+
+    return pack_buyer_addresses(search_buyer_address, jettons, payed, next_buyer);
+
+}
+
+cell repack_buyer(cell buyers, slice search_buyer_address, int new_jettons) inline {
+    slice parser = buyers.begin_parse();
+
+    if (parser.slice_bits() == 0) {
+      return pack_buyer_addresses(search_buyer_address, new_jettons, 0, buyers);
+    }
+
+    slice buyer_address = parser~load_msg_addr();
+    int jettons = parser~load_coins();
+    int payed = parser~load_uint(1);
+
+    if (equal_slice_bits(search_buyer_address, buyer_address)){
+
+        cell next = parser~load_ref();
+
+        return pack_buyer_addresses(buyer_address, new_jettons + jettons, 0, next);
+    }
+
+    if (parser.slice_refs() == 0) {
+      return pack_buyer_addresses(search_buyer_address, new_jettons, 0, buyers);
+    }
+
+    cell next = parser~load_ref();
+
+    cell next_buyer = repack_buyer(next, search_buyer_address, new_jettons);
+
+    return pack_buyer_addresses(search_buyer_address, jettons, payed, next_buyer);
+
+}
+
+cell get_buyer(cell buyers, slice search_buyer_address) inline {
+    slice parser = buyers.begin_parse();
+
+    if (parser.slice_bits() == 0) {
+      return begin_cell().end_cell();
+    }
+
+    slice buyer_address = parser~load_msg_addr();
+    int jettons = parser~load_coins();
+    int payed = parser~load_uint(1);
+
+    if (equal_slice_bits(search_buyer_address, buyer_address)){
+        return buyers;
+    }
+
+    if (parser.slice_refs() == 0) {
+      return begin_cell().end_cell();
+    }
+
+    cell next = parser~load_ref();
+
+    return get_buyer(next, search_buyer_address);
+}
+
+cell get_data_buyer(slice address) method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  cell buyer = get_buyer(buyers, address);
+
+  return buyer;
+}
+
+(int, int, int, cell, int) get_data_wallet(slice address) method_id {
+  (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+  cell buyer = get_buyer(buyers, address);
+
+  return (presale, balance, referred_percentage, buyer, count);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) { ;; ignore empty messages
+    return ();
+  }
+
+  var (op) = in_msg_body~load_uint(32);  ;; opcode
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+
+  ;; buy jettons with TON
+  if (op == 1) {
+    slice sender_address = cs~load_msg_addr();
+    slice dst_address = cs~load_msg_addr();
+    int incoming_ton = cs~load_coins();
+
+    (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+    throw_if(error::unauthorized_mint_request, presale == 0);
+
+    int query_id = in_msg_body~load_query_id();
+    slice child_wallet =  in_msg_body~load_msg_addr();
+    slice referred_address =  in_msg_body~load_msg_addr();
+
+    throw_if(error::not_enough_tons, incoming_ton < min_amount()); 
+
+    throw_if(error::not_enough_space, count >= 500); 
+
+    int current_time = now();
+    int days_elapsed = (current_time - deployment_time) / 86400;
+    int multiplier = (1 << days_elapsed / 7) * (1000 + (2 * (days_elapsed % 7))) / 1000;
+
+    int jetton_price = initial_value * multiplier;
+
+    int jetton_amount = incoming_ton / jetton_price;
+
+    buyers = repack_buyer(buyers, sender_address, jetton_amount);
+
+    int referred_amount = 0;
+
+    if (equal_slice_bits(referred_address, sender_address) == false) {
+      referred_amount = incoming_ton / referred_percentage;
+
+      var msg = begin_cell()
+        .store_uint(0x10, 6)
+        .store_slice(referred_address)
+        .store_coins(referred_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(op::excesses, 32)
+        .store_uint(query_id, 64);
+      send_raw_message(msg.end_cell(), 1);
+    }
+
+    balance = balance + jetton_amount;
+
+    count = count + 1;
+
+    save_data(presale, balance, referred_percentage, owner_address, jetton_master_address, jetton_wallet_code, buyers, count);
+
+    return ();
+  }
+
+  ;; withdraw TON
+  if (op == 2){
+    slice sender_address = cs~load_msg_addr();
+
+    int query_id = in_msg_body~load_uint(64);
+
+    int amount = in_msg_body~load_coins();
+
+    (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+    throw_unless(error::unauthorized_transfer,
+        equal_slice_bits(sender_address, owner_address)
+    );
+
+    var msg = begin_cell()
+      .store_uint(0x10, 6)
+      .store_slice(sender_address)
+      .store_coins(amount)
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_uint(op::excesses, 32)
+      .store_uint(query_id, 64);
+    send_raw_message(msg.end_cell(), 1);
+
+  }
+
+  ;; buyer request jettons
+  if (op == 3){
+    slice sender_address = cs~load_msg_addr();
+    slice dst_address = cs~load_msg_addr();
+    int incoming_ton = cs~load_coins();
+
+    (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+    int query_id = in_msg_body~load_query_id();
+
+    int fees = transfer_amount() + forward_amount() + gas_consumption();
+
+    throw_if(error::not_enough_tons, incoming_ton < fees);
+
+    throw_if(error::unauthorized_mint_request, presale == 1);
+
+    buyers = pay_buyer(buyers, sender_address, query_id, jetton_master_address, jetton_wallet_code);
+
+    save_data(presale, balance, referred_percentage, owner_address, jetton_master_address, jetton_wallet_code, buyers, count);
+
+    return();
+  }
+
+
+  ;; set presale opened or closed
+  if (op == 4){
+    slice sender_address = cs~load_msg_addr();
+
+    int query_id = in_msg_body~load_uint(64);
+
+    int new_presale = in_msg_body~load_uint(1);
+
+    (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+    throw_unless(error::unauthorized_transfer,
+        equal_slice_bits(sender_address, owner_address)
+    );
+
+    save_data(new_presale, balance, referred_percentage, owner_address, jetton_master_address, jetton_wallet_code, buyers, count);
+
+  }
+
+  ;; withdraw jettons only admin
+  if (op == 5){
+    slice sender_address = cs~load_msg_addr();
+
+    int query_id = in_msg_body~load_uint(64);
+
+    int jetton_amount = in_msg_body~load_coins();
+
+    (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+    throw_unless(error::unauthorized_transfer,
+        equal_slice_bits(sender_address, owner_address)
+    );
+
+    slice child_wallet = calc_user_wallet(my_address(), jetton_master_address, jetton_wallet_code);
+
+    var msg = begin_cell()
+            .store_msg_flag(msg_flag::bounceable)
+            .store_slice(child_wallet)
+            .store_coins(transfer_amount())
+            .store_msgbody_prefix_ref(
+              begin_cell()
+              .store_op(op::transfer)
+              .store_query_id(query_id)
+              .store_coins(jetton_amount)
+              .store_slice(sender_address)
+              .store_slice(sender_address)
+              .store_int(false, 1)
+              .store_coins(forward_amount())
+              .store_int(false, 1)
+              .end_cell()
+            );
+
+    return send_raw_message(msg.end_cell(), REVERT_ON_ERRORS);
+  }
+
+  ;; set referred_percentage
+  if (op == 6){
+    slice sender_address = cs~load_msg_addr();
+
+    int query_id = in_msg_body~load_uint(64);
+
+    int new_referred_percentage = in_msg_body~load_uint(7);
+
+    (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+    throw_unless(error::unauthorized_transfer,
+        equal_slice_bits(sender_address, owner_address)
+    );
+
+    save_data(presale, balance, new_referred_percentage, owner_address, jetton_master_address, jetton_wallet_code, buyers, count);
+
+  }
+
+  ;; set jetton_master_address
+  if (op == 7){
+    slice sender_address = cs~load_msg_addr();
+
+    int query_id = in_msg_body~load_uint(64);
+
+    slice new_jetton_master_address = in_msg_body~load_msg_addr();
+
+    (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+    throw_unless(error::unauthorized_transfer,
+        equal_slice_bits(sender_address, owner_address)
+    );
+
+    save_data(presale, balance, referred_percentage, owner_address, new_jetton_master_address, jetton_wallet_code, buyers, count);
+
+  }
+
+  ;; set jetton_wallet_code
+  if (op == 8){
+    slice sender_address = cs~load_msg_addr();
+
+    int query_id = in_msg_body~load_uint(64);
+
+    cell new_jetton_wallet_code = in_msg_body~load_ref();
+
+    (int presale, int balance, int referred_percentage, slice owner_address, slice jetton_master_address, cell jetton_wallet_code, cell buyers, int count) = load_data();
+
+    throw_unless(error::unauthorized_transfer,
+        equal_slice_bits(sender_address, owner_address)
+    );
+
+    save_data(presale, balance, referred_percentage, owner_address, jetton_master_address, new_jetton_wallet_code, buyers, count);
+
+  }
+
+}
