@@ -1,5 +1,4 @@
-npm install husky --save-dev
-
+npm install
 npx func-js contracts/pre_sale.fc --boc build/pre_sale.cell
 xxd -p build/pre_sale.cell
 
